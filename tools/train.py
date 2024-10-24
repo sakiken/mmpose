@@ -17,7 +17,7 @@ def parse_args():
         type=str,
         const='auto',
         help='If specify checkpint path, resume from it, while if not '
-        'specify, try to auto resume from the latest checkpoint '
+        'specify, trys to auto resume from the latest checkpoint '
         'in the work directory.')
     parser.add_argument(
         '--amp',
