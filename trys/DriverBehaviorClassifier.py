@@ -22,81 +22,86 @@ class DriverBehaviorClassifier(nn.Module):
         x = self.fc2(x)
         return x
 
+class ChannelAttention(nn.Module):
+    def __init__(self, num_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Conv2d(num_channels, num_channels // reduction_ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Conv2d(num_channels // reduction_ratio, num_channels, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
-class CrossAttention(nn.Module):
-    def __init__(self, query_dim, key_dim, value_dim, embed_dim, num_heads=8):
-        super(CrossAttention, self).__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.query = nn.Linear(query_dim, embed_dim)
-        self.key = nn.Linear(key_dim, embed_dim)
-        self.value = nn.Linear(value_dim, embed_dim)
-        self.out = nn.Linear(embed_dim, embed_dim)
+    def forward(self, x):
+        avg_out = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
-    def forward(self, query, key, value):
-        B, Nq, _ = query.shape
-        B, Nk, _ = key.shape
-        q = self.query(query).view(B, Nq, self.num_heads, self.embed_dim // self.num_heads).permute(0, 2, 1, 3)
-        k = self.key(key).view(B, Nk, self.num_heads, self.embed_dim // self.num_heads).permute(0, 2, 1, 3)
-        v = self.value(value).view(B, Nk, self.num_heads, self.embed_dim // self.num_heads).permute(0, 2, 1, 3)
+class KeypointAttention(nn.Module):
+    def __init__(self, num_keypoints):
+        super(KeypointAttention, self).__init__()
+        self.attention_weights = nn.Parameter(torch.randn(num_keypoints, 1))
 
-        attn = (q @ k.transpose(-2, -1)) / (self.embed_dim // self.num_heads) ** 0.5
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B, Nq, self.embed_dim)
-        x = self.out(x)
-        return x
+    def forward(self, keypoints, scores):
+        attention_weights = F.softmax(self.attention_weights, dim=0)
+        # 将关键点的坐标和置信度分数与注意力权重相乘
+        weighted_keypoints = keypoints * attention_weights.view(1, -1, 1)
+        weighted_scores = scores * attention_weights.view(1, -1, 1)
+        # 合并加权后的关键点坐标和置信度分数
+        combined_keypoints = torch.cat((weighted_keypoints, weighted_scores), dim=2)
+        return combined_keypoints.view(combined_keypoints.size(0), -1)
 
-
-class DriverBehaviorClassifierWithCrossAttention(nn.Module):
+class DriverBehaviorClassifierWithAttention(nn.Module):
     def __init__(self, num_classes=10, num_keypoints=133):
-        super(DriverBehaviorClassifierWithCrossAttention, self).__init__()
+        super(DriverBehaviorClassifierWithAttention, self).__init__()
 
-        # 加载ResNet-50模型，不使用预训练权重
+        # 图像路径
         self.resnet = resnet50(weights=None)
-
-        # 替换最后一层全连接层
         num_features = self.resnet.fc.in_features
-        self.resnet.fc = nn.Identity()  # 移除原ResNet的最后一层
-
-        # 全连接层
+        self.resnet.fc = nn.Identity()  # 移除最后的全连接层
         self.image_fc = nn.Linear(num_features, 512)
-        self.keypoint_fc = nn.Linear(num_keypoints * 2 + num_keypoints, 512)  # 关键点位置和分数的总维度
+        self.image_classification_fc = nn.Linear(512, num_classes)  # 图像分类层
 
-        # 交叉注意力机制
-        self.cross_attention = CrossAttention(query_dim=512, key_dim=512, value_dim=512, embed_dim=512, num_heads=8)
+        # 关键点路径
+        self.keypoint_fc = nn.Linear(num_keypoints * 3, 512)  # x, y, score
+        self.keypoint_classification_fc = nn.Linear(512, num_classes)  # 关键点分类层
 
-        # 分类任务的全连接层
-        self.classification_fc = nn.Linear(512, num_classes)
+        # 注意力模块
+        self.channel_attention = ChannelAttention(512)  # 通道注意力模块
+        self.keypoint_attention = KeypointAttention(num_keypoints)
 
-        # 添加 BatchNorm 和 Dropout
         self.bn = nn.BatchNorm1d(512)
         self.dropout = nn.Dropout(0.5)
 
-    def forward(self, image, keypoints, keypoint_scores):
-        # 通过ResNet主干网络处理图像
+    def forward(self, image, keypoints, scores):
+        # 图像路径
         image_features = self.resnet(image)
-
-        # 处理图像特征
         image_features = F.relu(self.image_fc(image_features))
         image_features = self.bn(image_features)
         image_features = self.dropout(image_features)
 
-        # 处理关键点特征
-        keypoints = keypoints.view(keypoints.size(0), -1)
-        keypoint_scores = keypoint_scores.view(keypoint_scores.size(0), -1)
-        keypoint_features = torch.cat((keypoints, keypoint_scores), dim=1)
-        keypoint_features = F.relu(self.keypoint_fc(keypoint_features))
+        # 应用通道注意力
+        attention_weights = self.channel_attention(image_features.unsqueeze(2).unsqueeze(3))
+        image_features = image_features * attention_weights.squeeze(-1).squeeze(-1)
+
+        # 图像分类
+        image_probabilities = F.softmax(self.image_classification_fc(image_features), dim=1)
+
+        # 关键点路径
+        keypoints = keypoints.view(keypoints.size(0), -1, 2)  # 调整关键点的维度
+        scores = scores.view(scores.size(0), -1, 1)  # 调整分数的维度
+        combined_keypoints = self.keypoint_attention(keypoints, scores)
+
+        keypoint_features = F.relu(self.keypoint_fc(combined_keypoints))
         keypoint_features = self.bn(keypoint_features)
         keypoint_features = self.dropout(keypoint_features)
 
-        # 应用交叉注意力机制
-        attention_features = self.cross_attention(
-            image_features.unsqueeze(1),
-            keypoint_features.unsqueeze(1),
-            keypoint_features.unsqueeze(1)
-        ).squeeze(1)
+        # 关键点分类
+        keypoint_probabilities = F.softmax(self.keypoint_classification_fc(keypoint_features), dim=1)
 
-        # 分类任务的输出
-        classification_output = self.classification_fc(attention_features)
+        # 融合策略：使用简单的平均
+        combined_probabilities = (image_probabilities + keypoint_probabilities) / 2.0
 
-        return classification_output
+        return combined_probabilities
+
