@@ -157,3 +157,51 @@ class DistractedDriverDatasetWithKeypoints(Dataset):
         assert isinstance(label, int), f"Label is not an integer: {label}"
 
         return image, keypoints, keypoint_scores, torch.tensor(label, dtype=torch.long)
+
+
+class DistractedDriverDataset1(Dataset):
+    def __init__(self, features_dir, image_dir, csv_file, num_samples=None):
+        self.features_dir = features_dir
+        self.image_dir = image_dir
+        self.data_frame = pd.read_csv(csv_file)
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])  # 实例化转换
+        self.label_mapping = {'c0': 0, 'c1': 1, 'c2': 2, 'c3': 3, 'c4': 4,
+                              'c5': 5, 'c6': 6, 'c7': 7, 'c8': 8, 'c9': 9}  # 标签映射
+
+        if num_samples is not None:
+            self.data_frame = self.data_frame.head(num_samples)
+
+    def __len__(self):
+        return len(self.data_frame)
+
+    def __getitem__(self, idx):
+        img_name = self.data_frame.iloc[idx, 2]  # img
+        class_name = self.data_frame.iloc[idx, 1]  # classname
+        subject = self.data_frame.iloc[idx, 0]  # subject
+        features_path = os.path.join(self.features_dir, subject, class_name, img_name.replace('.jpg', '_features.npy'))
+        features_path = features_path.replace("\\", "/")  # 将路径中的反斜杠替换为正斜杠
+
+        # 加载关键点数据
+        keypoints_data = np.load(features_path)[0]  # 移除第一个维度，它只是包装数组
+
+        # 分离关键点坐标和置信度分数
+        keypoints = torch.tensor(keypoints_data[:, :2], dtype=torch.float32)  # 坐标
+        scores = torch.tensor(keypoints_data[:, 2], dtype=torch.float32)  # 置信度分数
+
+        label = self.label_mapping[class_name]  # 映射标签到整数
+
+        # 打开图像文件
+        img_path = os.path.join(self.image_dir, class_name, img_name)
+        image = Image.open(img_path).convert('RGB')
+
+        # 应用转换
+        image = self.transform(image)
+
+        assert image.shape == (3, 480, 640), f"Image shape is incorrect: {image.shape}"
+        assert keypoints.shape == (133, 2), f"Keypoints shape is incorrect: {keypoints.shape}"
+        assert scores.shape == (133,), f"Scores shape is incorrect: {scores.shape}"
+        assert isinstance(label, int), f"Label is not an integer: {label}"
+
+        return image, keypoints, scores, torch.tensor(label, dtype=torch.long)
